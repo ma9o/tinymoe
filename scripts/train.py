@@ -1,36 +1,19 @@
 import os, math, argparse, time, json, sys
 import _bootstrap; _bootstrap.bootstrap()
 import torch, torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset
+from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerFast
 from tqdm import tqdm
 from models.config import Config
 from models.model import TinyMoeGPT, moe_aux_loss, router_z_loss
+from utils.data_cache import prepare_packed_datasets
 
 def get_device(cfg: Config):
     if not torch.backends.mps.is_available():
         raise RuntimeError("MPS device not available. Please use an Apple Silicon Mac with MPS enabled (PYTORCH_ENABLE_MPS_FALLBACK=1).")
     return "mps"
 
-class PackedDataset(Dataset):
-    def __init__(self, texts, tok, seq_len, progress_desc=None):
-        ids = []
-        iterator = tqdm(texts, desc=progress_desc) if progress_desc else texts
-        for t in iterator:
-            enc = tok.encode(t)
-            enc_ids = enc.ids if hasattr(enc, "ids") else enc
-            ids.extend(enc_ids)
-        # pack into fixed blocks
-        # drop remainder for simplicity
-        n = (len(ids) // seq_len) * seq_len
-        ids = ids[:n]
-        self.data = torch.tensor(ids, dtype=torch.long).view(-1, seq_len)
-    def __len__(self):
-        return self.data.size(0)
-    def __getitem__(self, idx):
-        x = self.data[idx]
-        return x
+# (Packing/caching moved to utils.data_cache)
 
 def cosine_lr(step, max_steps, max_lr, min_lr=1e-5, warmup=1000):
     if step < warmup:
@@ -48,6 +31,8 @@ def main():
     ap.add_argument("--eval_every", type=int, default=200)
     ap.add_argument("--train_limit", type=int, default=200_000, help="limit number of train rows (-1 for all)")
     ap.add_argument("--val_limit", type=int, default=5_000, help="limit number of validation rows (-1 for all)")
+    ap.add_argument("--cache_dir", default=None, help="directory to cache packed tensors (default: <out_dir>/cache)")
+    ap.add_argument("--rebuild_cache", action="store_true", help="force rebuild tokenized cache")
     args = ap.parse_args()
 
     cfg = Config()
@@ -75,34 +60,15 @@ def main():
         cfg.vocab_size = int(vocab_size)
         print(f"[config] adjusted cfg.vocab_size -> {cfg.vocab_size}")
 
-    # Data
-    print(f"[data] loading dataset={cfg.dataset_name}")
-    train_ds = load_dataset(cfg.dataset_name, split="train")
-    val_ds = load_dataset(cfg.dataset_name, split="validation")
-
-    if args.train_limit > 0:
-        try:
-            n = min(args.train_limit, len(train_ds))
-            train_ds = train_ds.select(range(n))
-        except Exception:
-            pass
-    if args.val_limit > 0:
-        try:
-            n = min(args.val_limit, len(val_ds))
-            val_ds = val_ds.select(range(n))
-        except Exception:
-            pass
-
-    train_texts = train_ds[cfg.text_field]
-    val_texts = val_ds[cfg.text_field]
-
-    print(f"[data] dataset={cfg.dataset_name} field={cfg.text_field}")
-    print(f"[data] train_texts={len(train_texts)} val_texts={len(val_texts)}")
-
-    # Tokenize + pack with visible progress
-    train_set = PackedDataset(train_texts, tok, cfg.seq_len, progress_desc="[pack] train")
-    val_set = PackedDataset(val_texts, tok, cfg.seq_len, progress_desc="[pack] val")
-    print(f"[data] packed: train_seqs={len(train_set)} val_seqs={len(val_set)} seq_len={cfg.seq_len}")
+    cache_dir = args.cache_dir or os.path.join(args.out_dir, 'cache')
+    train_set, val_set = prepare_packed_datasets(
+        cfg, tok,
+        train_limit=args.train_limit,
+        val_limit=args.val_limit,
+        cache_dir=cache_dir,
+        rebuild_cache=args.rebuild_cache,
+        tokenizer_path=os.path.abspath(args.tokenizer),
+    )
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=cfg.num_workers)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=cfg.num_workers)
