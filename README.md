@@ -47,6 +47,26 @@ python scripts/train.py   --tokenizer tokenizer.json   --out_dir checkpoints   -
 - Increase `batch_size` and/or `grad_accum_steps` until memory is comfy.
 - Adjust `Config.lr/warmup` for your token budget; defaults are conservative.
 
+### Speed/Utilization knobs
+
+These flags can help better utilize your CPU/GPU on Apple Silicon:
+
+```bash
+# Example: use more loader workers, prefetch, persistent workers, and compile
+python scripts/train.py \
+  --tokenizer tokenizer.json --out_dir checkpoints \
+  --batch_size 16 --grad_accum_steps 1 --max_steps 2000 \
+  --num_workers 8 --prefetch_factor 4 --persistent_workers --compile
+```
+
+- `--num_workers`: DataLoader workers; try `os.cpu_count()-1`.
+- `--prefetch_factor`: number of batches queued per worker (only when workers>0).
+- `--persistent_workers`: keep workers alive across iterations to reduce spawn overhead.
+- `--compile`: enable `torch.compile` (PyTorch 2+) to fuse/optimize kernels.
+- `--torch_num_threads`: cap CPU intra‑op threads (e.g., `--torch_num_threads 8`).
+
+If training is GPU‑bound, increase `--batch_size` or `seq_len` in `models/config.py` (or use grad accumulation) until memory is well utilized.
+
 ---
 
 ## 3) Sample from a checkpoint

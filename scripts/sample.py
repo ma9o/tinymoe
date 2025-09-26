@@ -1,7 +1,6 @@
 import argparse, torch
 import sys, os
-# Ensure project root is on PYTHONPATH when running as a script
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import _bootstrap; _bootstrap.bootstrap()
 from transformers import PreTrainedTokenizerFast
 from models.config import Config
 from models.model import TinyMoeGPT

@@ -3,3 +3,5 @@ datasets>=2.18.0
 transformers>=4.42.0
 tokenizers>=0.15.0
 tqdm>=4.65.0
+pyarrow
+hf_transfer

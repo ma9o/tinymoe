@@ -4,7 +4,8 @@ Train a 10k BPE tokenizer on TinyStories and save as tokenizer.json
 Usage:
   python scripts/build_tokenizer.py --dataset roneneldan/TinyStories --out tokenizer.json --vocab_size 10000
 """
-import argparse, os
+import argparse, os, sys
+import _bootstrap; _bootstrap.bootstrap()
 from datasets import load_dataset
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
@@ -49,4 +50,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

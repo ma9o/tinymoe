@@ -1,8 +1,6 @@
-import os, math, argparse, torch, torch.nn.functional as F
-import time, json
-import sys
-# Ensure project root is on PYTHONPATH when running as a script
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import os, math, argparse, time, json, sys
+import _bootstrap; _bootstrap.bootstrap()
+import torch, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from transformers import PreTrainedTokenizerFast
@@ -16,9 +14,10 @@ def get_device(cfg: Config):
     return "mps"
 
 class PackedDataset(Dataset):
-    def __init__(self, texts, tok, seq_len):
+    def __init__(self, texts, tok, seq_len, progress_desc=None):
         ids = []
-        for t in texts:
+        iterator = tqdm(texts, desc=progress_desc) if progress_desc else texts
+        for t in iterator:
             enc = tok.encode(t)
             enc_ids = enc.ids if hasattr(enc, "ids") else enc
             ids.extend(enc_ids)
@@ -47,6 +46,14 @@ def main():
     ap.add_argument("--grad_accum_steps", type=int, default=1)
     ap.add_argument("--max_steps", type=int, default=2000)
     ap.add_argument("--eval_every", type=int, default=200)
+    ap.add_argument("--train_limit", type=int, default=200_000, help="limit number of train rows (-1 for all)")
+    ap.add_argument("--val_limit", type=int, default=5_000, help="limit number of validation rows (-1 for all)")
+    # Performance knobs
+    ap.add_argument("--num_workers", type=int, default=None, help="DataLoader workers (override cfg.num_workers).")
+    ap.add_argument("--prefetch_factor", type=int, default=4, help="Batches prefetched per worker (only when num_workers>0).")
+    ap.add_argument("--persistent_workers", action="store_true", help="Keep DataLoader workers alive between iterations.")
+    ap.add_argument("--compile", action="store_true", help="Compile the model with torch.compile (PyTorch 2+).")
+    ap.add_argument("--torch_num_threads", type=int, default=None, help="Set torch.set_num_threads for CPU ops.")
     args = ap.parse_args()
 
     cfg = Config()
@@ -60,6 +67,14 @@ def main():
     dtype = torch.float16 if cfg.precision == "fp16" else torch.bfloat16
     print(f"[setup] device={device} precision={cfg.precision} dtype={dtype}")
 
+    # Optional CPU thread cap (can help dataloading/tokenization parallelism)
+    if args.torch_num_threads is not None and args.torch_num_threads > 0:
+        try:
+            torch.set_num_threads(args.torch_num_threads)
+            print(f"[setup] torch.set_num_threads({args.torch_num_threads})")
+        except Exception as e:
+            print(f"[warn] set_num_threads failed: {e}")
+
     # Tokenizer
     tok = PreTrainedTokenizerFast(tokenizer_file=args.tokenizer)
     tok.pad_token = "[PAD]"; tok.unk_token="[UNK]"; tok.bos_token="[BOS]"; tok.eos_token="[EOS]"
@@ -68,28 +83,71 @@ def main():
     except Exception:
         vocab_size = None
     print(f"[tokenizer] path={args.tokenizer} vocab_size={vocab_size}")
+    if vocab_size is not None and vocab_size != cfg.vocab_size:
+        cfg.vocab_size = int(vocab_size)
+        print(f"[config] adjusted cfg.vocab_size -> {cfg.vocab_size}")
 
     # Data
+    print(f"[data] loading dataset={cfg.dataset_name}")
     train_ds = load_dataset(cfg.dataset_name, split="train")
     val_ds = load_dataset(cfg.dataset_name, split="validation")
 
-    train_texts = train_ds[cfg.text_field]
-    val_texts = val_ds[cfg.text_field][:5000]  # small eval slice
+    if args.train_limit > 0:
+        try:
+            n = min(args.train_limit, len(train_ds))
+            train_ds = train_ds.select(range(n))
+        except Exception:
+            pass
+    if args.val_limit > 0:
+        try:
+            n = min(args.val_limit, len(val_ds))
+            val_ds = val_ds.select(range(n))
+        except Exception:
+            pass
 
-    train_set = PackedDataset(train_texts, tok, cfg.seq_len)
-    val_set = PackedDataset(val_texts, tok, cfg.seq_len)
+    train_texts = train_ds[cfg.text_field]
+    val_texts = val_ds[cfg.text_field]
+
     print(f"[data] dataset={cfg.dataset_name} field={cfg.text_field}")
     print(f"[data] train_texts={len(train_texts)} val_texts={len(val_texts)}")
+
+    # Tokenize + pack with visible progress
+    train_set = PackedDataset(train_texts, tok, cfg.seq_len, progress_desc="[pack] train")
+    val_set = PackedDataset(val_texts, tok, cfg.seq_len, progress_desc="[pack] val")
     print(f"[data] packed: train_seqs={len(train_set)} val_seqs={len(val_set)} seq_len={cfg.seq_len}")
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=cfg.num_workers)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=cfg.num_workers)
+    # Allow overriding workers from CLI
+    if args.num_workers is not None:
+        cfg.num_workers = max(0, int(args.num_workers))
+
+    dl_common = {
+        'batch_size': args.batch_size,
+    }
+    # Conditionally add worker-related kwargs
+    if cfg.num_workers > 0:
+        dl_common.update({
+            'num_workers': cfg.num_workers,
+            'persistent_workers': bool(args.persistent_workers),
+        })
+        if args.prefetch_factor and args.prefetch_factor > 0:
+            dl_common['prefetch_factor'] = int(args.prefetch_factor)
+    else:
+        dl_common['num_workers'] = 0
+
+    train_loader = DataLoader(train_set, shuffle=True, **dl_common)
+    val_loader = DataLoader(val_set, shuffle=False, **dl_common)
     tokens_per_step = args.batch_size * cfg.seq_len
     eff_tokens_per_opt = tokens_per_step * cfg.grad_accum_steps
     print(f"[loader] batch_size={args.batch_size} grad_accum={cfg.grad_accum_steps} tokens/step={tokens_per_step} tokens/opt_step={eff_tokens_per_opt}")
 
     # Model
     model = TinyMoeGPT(cfg).to(device)
+    if args.compile:
+        try:
+            model = torch.compile(model)  # type: ignore[attr-defined]
+            print("[compile] torch.compile enabled")
+        except Exception as e:
+            print(f"[warn] torch.compile unavailable or failed: {e}")
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=cfg.betas, weight_decay=cfg.weight_decay)
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
