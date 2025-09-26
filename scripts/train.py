@@ -48,12 +48,6 @@ def main():
     ap.add_argument("--eval_every", type=int, default=200)
     ap.add_argument("--train_limit", type=int, default=200_000, help="limit number of train rows (-1 for all)")
     ap.add_argument("--val_limit", type=int, default=5_000, help="limit number of validation rows (-1 for all)")
-    # Performance knobs
-    ap.add_argument("--num_workers", type=int, default=None, help="DataLoader workers (override cfg.num_workers).")
-    ap.add_argument("--prefetch_factor", type=int, default=4, help="Batches prefetched per worker (only when num_workers>0).")
-    ap.add_argument("--persistent_workers", action="store_true", help="Keep DataLoader workers alive between iterations.")
-    ap.add_argument("--compile", action="store_true", help="Compile the model with torch.compile (PyTorch 2+).")
-    ap.add_argument("--torch_num_threads", type=int, default=None, help="Set torch.set_num_threads for CPU ops.")
     args = ap.parse_args()
 
     cfg = Config()
@@ -67,13 +61,7 @@ def main():
     dtype = torch.float16 if cfg.precision == "fp16" else torch.bfloat16
     print(f"[setup] device={device} precision={cfg.precision} dtype={dtype}")
 
-    # Optional CPU thread cap (can help dataloading/tokenization parallelism)
-    if args.torch_num_threads is not None and args.torch_num_threads > 0:
-        try:
-            torch.set_num_threads(args.torch_num_threads)
-            print(f"[setup] torch.set_num_threads({args.torch_num_threads})")
-        except Exception as e:
-            print(f"[warn] set_num_threads failed: {e}")
+    
 
     # Tokenizer
     tok = PreTrainedTokenizerFast(tokenizer_file=args.tokenizer)
@@ -116,38 +104,14 @@ def main():
     val_set = PackedDataset(val_texts, tok, cfg.seq_len, progress_desc="[pack] val")
     print(f"[data] packed: train_seqs={len(train_set)} val_seqs={len(val_set)} seq_len={cfg.seq_len}")
 
-    # Allow overriding workers from CLI
-    if args.num_workers is not None:
-        cfg.num_workers = max(0, int(args.num_workers))
-
-    dl_common = {
-        'batch_size': args.batch_size,
-    }
-    # Conditionally add worker-related kwargs
-    if cfg.num_workers > 0:
-        dl_common.update({
-            'num_workers': cfg.num_workers,
-            'persistent_workers': bool(args.persistent_workers),
-        })
-        if args.prefetch_factor and args.prefetch_factor > 0:
-            dl_common['prefetch_factor'] = int(args.prefetch_factor)
-    else:
-        dl_common['num_workers'] = 0
-
-    train_loader = DataLoader(train_set, shuffle=True, **dl_common)
-    val_loader = DataLoader(val_set, shuffle=False, **dl_common)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=cfg.num_workers)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=cfg.num_workers)
     tokens_per_step = args.batch_size * cfg.seq_len
     eff_tokens_per_opt = tokens_per_step * cfg.grad_accum_steps
     print(f"[loader] batch_size={args.batch_size} grad_accum={cfg.grad_accum_steps} tokens/step={tokens_per_step} tokens/opt_step={eff_tokens_per_opt}")
 
     # Model
     model = TinyMoeGPT(cfg).to(device)
-    if args.compile:
-        try:
-            model = torch.compile(model)  # type: ignore[attr-defined]
-            print("[compile] torch.compile enabled")
-        except Exception as e:
-            print(f"[warn] torch.compile unavailable or failed: {e}")
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=cfg.betas, weight_decay=cfg.weight_decay)
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 class Config:
     # Model
     vocab_size: int = 10_000
-    seq_len: int = 512
+    seq_len: int = 1024
     n_layers: int = 6
     d_model: int = 256
     n_heads: int = 8
