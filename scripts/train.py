@@ -1,4 +1,5 @@
 import os, math, argparse, time, json, sys
+from contextlib import nullcontext
 import _bootstrap; _bootstrap.bootstrap()
 import torch, torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -33,17 +34,31 @@ def main():
     ap.add_argument("--val_limit", type=int, default=5_000, help="limit number of validation rows (-1 for all)")
     ap.add_argument("--cache_dir", default=None, help="directory to cache packed tensors (default: <out_dir>/cache)")
     ap.add_argument("--rebuild_cache", action="store_true", help="force rebuild tokenized cache")
+    ap.add_argument("--precision", choices=["fp16", "bf16", "fp32"], default=None, help="override precision (default from Config)")
+    ap.add_argument("--num_workers", type=int, default=None, help="override DataLoader workers (macOS often fastest with 0)")
+    ap.add_argument("--prefetch_factor", type=int, default=2, help="DataLoader prefetch factor when num_workers>0")
+    ap.add_argument("--mlp_type", choices=["moe", "dense"], default=None, help="override MLP type")
     args = ap.parse_args()
 
     cfg = Config()
     cfg.grad_accum_steps = args.grad_accum_steps
     cfg.max_steps = args.max_steps
+    if args.precision is not None:
+        cfg.precision = args.precision
+    if args.mlp_type is not None:
+        cfg.mlp_type = args.mlp_type
+    if args.num_workers is not None:
+        cfg.num_workers = int(args.num_workers)
+    elif sys.platform == "darwin":
+        # On macOS, tensor datasets often run fastest with single-threaded loading.
+        cfg.num_workers = 0
 
     os.makedirs(args.out_dir, exist_ok=True)
     metrics_path = os.path.join(args.out_dir, "train_metrics.jsonl")
 
     device = get_device(cfg)
-    dtype = torch.float16 if cfg.precision == "fp16" else torch.bfloat16
+    use_amp = cfg.precision in ("fp16", "bf16")
+    dtype = (torch.float16 if cfg.precision == "fp16" else (torch.bfloat16 if cfg.precision == "bf16" else torch.float32))
     print(f"[setup] device={device} precision={cfg.precision} dtype={dtype}")
 
     
@@ -70,8 +85,16 @@ def main():
         tokenizer_path=os.path.abspath(args.tokenizer),
     )
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=cfg.num_workers)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=cfg.num_workers)
+    dl_common = {"batch_size": args.batch_size}
+    train_dl_kwargs = dict(dl_common)
+    val_dl_kwargs = dict(dl_common)
+    train_dl_kwargs.update({"shuffle": True, "num_workers": cfg.num_workers})
+    val_dl_kwargs.update({"shuffle": False, "num_workers": cfg.num_workers})
+    if cfg.num_workers and cfg.num_workers > 0:
+        train_dl_kwargs.update({"persistent_workers": True, "prefetch_factor": args.prefetch_factor})
+        val_dl_kwargs.update({"persistent_workers": True, "prefetch_factor": args.prefetch_factor})
+    train_loader = DataLoader(train_set, **train_dl_kwargs)
+    val_loader = DataLoader(val_set, **val_dl_kwargs)
     tokens_per_step = args.batch_size * cfg.seq_len
     eff_tokens_per_opt = tokens_per_step * cfg.grad_accum_steps
     print(f"[loader] batch_size={args.batch_size} grad_accum={cfg.grad_accum_steps} tokens/step={tokens_per_step} tokens/opt_step={eff_tokens_per_opt}")
@@ -87,19 +110,28 @@ def main():
     best_val = float("inf")
     last_log_time = time.time()
     tokens_since_last = 0
+    steps_since_last = 0
+    data_time_accum = 0.0
+    compute_time_accum = 0.0
     last_gnorm = None
+    last_iter_end = time.time()
 
     pbar = tqdm(train_loader, total=cfg.max_steps)
     for step, batch in enumerate(pbar):
         if global_step >= cfg.max_steps:
             break
         model.train()
-        x = batch.to(device)
+        t_fetch_start = time.time()
+        data_wait = t_fetch_start - last_iter_end
+        x = batch.to(device, non_blocking=True)
+        t_after_x = time.time()
 
         lr = cosine_lr(global_step, cfg.max_steps, cfg.lr, warmup=cfg.warmup_steps)
         for pg in opt.param_groups: pg["lr"] = lr
 
-        with torch.autocast(device_type="mps", dtype=dtype):
+        amp_ctx = torch.autocast(device_type="mps", dtype=dtype) if use_amp else nullcontext()
+        t_compute_start = t_after_x
+        with amp_ctx:
             logits, aux = model(x)
             V = logits.size(-1)
             ce = F.cross_entropy(logits[:, :-1].contiguous().view(-1, V), x[:, 1:].contiguous().view(-1))
@@ -121,7 +153,13 @@ def main():
             opt.step()
             opt.zero_grad(set_to_none=True)
 
+        t_step_end = time.time()
+        data_time_accum += (data_wait + (t_after_x - t_fetch_start))
+        compute_time_accum += (t_step_end - t_compute_start)
+        last_iter_end = t_step_end
+
         tokens_since_last += tokens_per_step
+        steps_since_last += 1
         if (global_step % cfg.log_every) == 0:
             try:
                 torch.mps.synchronize()
@@ -130,10 +168,14 @@ def main():
             now = time.time()
             dt = max(1e-6, now - last_log_time)
             tps = tokens_since_last / dt
+            avg_data = data_time_accum / max(1, steps_since_last)
+            avg_comp = compute_time_accum / max(1, steps_since_last)
+            frac_data = (data_time_accum / max(1e-9, data_time_accum + compute_time_accum))
             msg = (
                 f"step {global_step} | loss {loss.item():.4f} | ce {ce.item():.4f} | "
                 f"aux {float(aux_loss):.4f} | z {float(z_loss):.4f} | lr {lr:.2e} | "
-                f"toks/s {tps:,.0f} | gnorm {('-' if last_gnorm is None else f'{last_gnorm:.2f}')}"
+                f"toks/s {tps:,.0f} | data {avg_data*1000:.1f}ms | comp {avg_comp*1000:.1f}ms | data% {frac_data*100:.1f} | "
+                f"gnorm {('-' if last_gnorm is None else f'{last_gnorm:.2f}')}"
             )
             print(msg, flush=True)
             # tqdm postfix
@@ -141,7 +183,8 @@ def main():
                 'loss': f"{loss.item():.3f}",
                 'ce': f"{ce.item():.3f}",
                 'lr': f"{lr:.2e}",
-                't/s': f"{tps:,.0f}"
+                't/s': f"{tps:,.0f}",
+                'data%': f"{frac_data*100:.0f}"
             })
             # persist metrics
             try:
@@ -155,12 +198,18 @@ def main():
                         'z': float(z_loss),
                         'lr': float(lr),
                         'tokens_per_sec': float(tps),
+                        'avg_data_time_s': float(avg_data),
+                        'avg_compute_time_s': float(avg_comp),
+                        'data_fraction': float(frac_data),
                         'grad_norm': (None if last_gnorm is None else float(last_gnorm)),
                     }) + "\n")
             except Exception:
                 pass
             last_log_time = now
             tokens_since_last = 0
+            steps_since_last = 0
+            data_time_accum = 0.0
+            compute_time_accum = 0.0
 
         if (global_step % args.eval_every) == 0 and global_step > 0:
             val_ppl = evaluate(model, val_loader, device, dtype)
@@ -190,9 +239,11 @@ def main():
 def evaluate(model, loader, device, dtype):
     model.eval()
     losses = []
-    with torch.no_grad(), torch.autocast(device_type="mps", dtype=dtype):
+    use_amp = (dtype in (torch.float16, torch.bfloat16))
+    amp_ctx = torch.autocast(device_type="mps", dtype=dtype) if use_amp else nullcontext()
+    with torch.no_grad(), amp_ctx:
         for batch in loader:
-            x = batch.to(device)
+            x = batch.to(device, non_blocking=True)
             logits, _ = model(x)
             V = logits.size(-1)
             ce = F.cross_entropy(logits[:, :-1].contiguous().view(-1, V), x[:, 1:].contiguous().view(-1))

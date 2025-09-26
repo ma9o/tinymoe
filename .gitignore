@@ -106,3 +106,4 @@ logs/
 checkpoints/
 
 # Note: tokenizer.json is intentionally NOT ignored.
+repomix-output.xml
