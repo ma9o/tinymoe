@@ -19,7 +19,7 @@ This repo is a tiny, Apple‑silicon–friendly training stack to reproduce a de
 pip install -r requirements.txt
 ```
 
-> Apple Silicon: `pip install torch --index-url https://download.pytorch.org/whl/cpu` works, but prefer the official instructions for MPS if needed.
+> Apple Silicon: install PyTorch with MPS support using the official instructions for macOS. Avoid the CPU‑only wheel (`--index-url https://download.pytorch.org/whl/cpu`) if you need MPS acceleration.
 
 ---
 
@@ -43,7 +43,7 @@ python scripts/train.py   --tokenizer tokenizer.json   --out_dir checkpoints   -
 ```
 
 **Tips**
-- On M1 Max, `device` auto‑selects **mps**. You can force CPU/CUDA by editing `Config.device`.
+- Device is fixed to **MPS**. Ensure `torch.backends.mps.is_available()` returns True.
 - Increase `batch_size` and/or `grad_accum_steps` until memory is comfy.
 - Adjust `Config.lr/warmup` for your token budget; defaults are conservative.
 

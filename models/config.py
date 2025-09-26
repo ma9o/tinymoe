@@ -37,5 +37,4 @@ class Config:
 
     # System
     precision: str = "fp16"  # "fp16" or "bf16"
-    device: str = "auto"     # "mps", "cuda", or "cpu"
-
+    device: str = "mps"      # MPS only
