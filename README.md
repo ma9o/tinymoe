@@ -42,3 +42,28 @@ y = (x - mean) / sqrt(var) * γ + β
 rms = sqrt(sum(x²) / n) # 1 pass
 y = x / rms * γ
 ```
+
+**Activation functions**
+
+The field evolved from ReLU to GELU to SiLU (Swish) to GLU (Gated Linear Unit) to SwiGLU (SiLU + GLU).
+
+ReLU, GELU, and SiLU all have a smiliar shape of ~0 for negative inputs and ~x for large positive inputs, but their derivatives are progressively smoother which helps with optimization:
+
+![Activation Functions Comparison](docs/act_derivatives.png)
+
+- ReLU(x) = max(0, x)
+- GELU(x) = x * Φ(x) where Φ(x) is the CDF of the standard normal distribution
+- SiLU(x) = x * sigmoid(x)
+
+GLU and SwiGLU introduce a gating mechanism (another set of learnable weights per each neuron) that allows the network to learn to "turn on" or "turn off" certain neurons based on the input. 
+
+SwiGLU(x) = (W₁x) ⊗ Swish(W₂x)
+
+**FFN Expand-Then-Project Pattern**
+
+It's a computational efficiency optimization, not a representation learning requirement. Given a parameter budget, you want to maximize capacity where it's cheapest.
+
+- Attention is O(n²) in sequence length → keep d_model small (e.g., 768)
+- FFNs are O(n) → expand here (e.g., 4x to 3072)
+ 
+This allocates ~2/3 of parameters to FFNs while keeping attention/residual stream cheap (instead of having a huge d_model everywhere).
